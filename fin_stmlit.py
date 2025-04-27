@@ -37,19 +37,9 @@ else:
     uploaded_file = st.file_uploader("Upload CSV", type="csv")
     if uploaded_file:
         df_alloc = pd.read_csv(uploaded_file)
-        df_alloc.columns = df_alloc.columns.str.strip().str.lower()  # מנקה רווחים ומקטין לאותיות קטנות
-        required_cols = {"symbol", "target_allocation"}
-        if not required_cols.issubset(df_alloc.columns):
-            st.error(f"CSV must contain the columns: {required_cols}")
-            st.stop()
-
+        df_alloc.columns = [col.lower().strip() for col in df_alloc.columns]
         df_alloc["symbol"] = df_alloc["symbol"].str.upper().str.strip()
         df_alloc["target_allocation"] = df_alloc["target_allocation"] / df_alloc["target_allocation"].sum()
-
-#    if uploaded_file:
-#        df_alloc = pd.read_csv(uploaded_file)
-#        df_alloc["symbol"] = df_alloc["symbol"].str.upper().str.strip()
-#        df_alloc["target_allocation"] = df_alloc["target_allocation"] / df_alloc["target_allocation"].sum()
     else:
         st.stop()
 
@@ -60,7 +50,10 @@ df_alloc = st.data_editor(df_alloc, num_rows="dynamic")
 investment = st.number_input("Total investment amount ($)", min_value=100.0, step=100.0)
 
 # Optimization mode
-mode = st.selectbox("Optimization strategy", ["Minimize deviation from target allocation", "Maximize money usage"])
+mode = st.selectbox("Optimization strategy", ["Weighted compromise (recommended)", "Minimize deviation from target allocation", "Maximize money usage"])
+
+if mode == "Weighted compromise (recommended)":
+    alpha = st.slider("Priority for matching target allocation", 0.0, 1.0, 0.8)
 
 # Fetch current prices
 @st.cache_data(ttl=3600)
@@ -80,7 +73,7 @@ if df_alloc['price'].isnull().any():
     st.stop()
 
 # Optimization model
-model = LpProblem("StockAllocation", LpMinimize if mode == "Minimize deviation from target allocation" else LpMaximize)
+model = LpProblem("StockAllocation", LpMinimize)
 quantities = {s: LpVariable(f"qty_{s}", lowBound=0, cat=LpInteger) for s in symbols}
 
 if mode == "Minimize deviation from target allocation":
@@ -96,15 +89,29 @@ if mode == "Minimize deviation from target allocation":
     model += lpSum([quantities[s] * prices[s] for s in symbols]) <= investment
     model += lpSum([quantities[s] * prices[s] for s in symbols]) >= investment - 100
 
-else:
-    # Maximize use of funds
+elif mode == "Maximize money usage":
     model += lpSum([quantities[s] * prices[s] for s in symbols])
     model += lpSum([quantities[s] * prices[s] for s in symbols]) <= investment
+
+elif mode == "Weighted compromise (recommended)":
+    target_values = {s: df_alloc.loc[df_alloc['symbol'] == s, 'target_allocation'].values[0] * investment for s in symbols}
+    deviation_vars = {s: LpVariable(f"dev_{s}", lowBound=0, cat=LpContinuous) for s in symbols}
+
+    for s in symbols:
+        actual_cost = quantities[s] * prices[s]
+        model += actual_cost - target_values[s] <= deviation_vars[s]
+        model += target_values[s] - actual_cost <= deviation_vars[s]
+
+    total_invested = lpSum([quantities[s] * prices[s] for s in symbols])
+    unused_money = investment - total_invested
+
+    model += alpha * lpSum(deviation_vars.values()) + (1 - alpha) * unused_money
+    model += total_invested <= investment
 
 model.solve()
 
 # Output results
-df_alloc['quantity'] = df_alloc['symbol'].map(lambda s: int(quantities[s].value()))
+df_alloc['quantity'] = df_alloc['symbol'].map(lambda s: int(quantities[s].value()) if quantities[s].value() is not None else 0)
 df_alloc['total_cost'] = df_alloc['quantity'] * df_alloc['price']
 df_alloc['final_allocation'] = df_alloc['total_cost'] / df_alloc['total_cost'].sum()
 
@@ -120,7 +127,6 @@ if not df_alloc_plot.empty:
     st.pyplot(fig)
 else:
     st.warning("No valid allocations to plot.")
-
 
 # Unused funds
 used = df_alloc['total_cost'].sum()
